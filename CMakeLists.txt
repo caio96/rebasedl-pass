@@ -1,10 +1,10 @@
-cmake_minimum_required(VERSION 3.13.4)
+cmake_minimum_required(VERSION 3.20)
 project(rebasedl-pass)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 #===============================================================================
-# 1. Verify LLVM installation
+# 1. VERIFY LLVM INSTALLATION DIR
 # This is just a bit of a sanity checking.
 #===============================================================================
 set(LT_LLVM_INSTALL_DIR "" CACHE PATH "LLVM installation directory")
@@ -37,7 +37,7 @@ if(NOT ${LT_VALID_INSTALLATION})
 endif()
 
 #===============================================================================
-# 2. Load LLVM Configuration
+# 2. LOAD LLVM CONFIGURATION
 #    For more: http://llvm.org/docs/CMake.html#embedding-llvm-in-your-project
 #===============================================================================
 # Add the location of LLVMConfig.cmake to CMake search paths (so that
@@ -48,11 +48,14 @@ endif()
 # `find_package(llvm)`. So there's no need to add it here.
 list(APPEND CMAKE_PREFIX_PATH "${LT_LLVM_INSTALL_DIR}/lib/cmake/llvm/")
 
-find_package(LLVM 16 REQUIRED CONFIG)
+# The way LLVMConfigVersion.cmake is set up, it will only match MAJOR.MINOR
+# exactly, even if we do not specify "REQUIRED" in the statement below.
+# So we accept any version and do the proper ranged check below.
+find_package(LLVM CONFIG)
 
-# Another sanity check
-if(NOT "16" VERSION_EQUAL "${LLVM_VERSION_MAJOR}")
-  message(FATAL_ERROR "Found LLVM ${LLVM_VERSION_MAJOR}, but need LLVM 16")
+# We defer the version checking to this statement
+if("${LLVM_VERSION_MAJOR}" VERSION_LESS 17)
+  message(FATAL_ERROR "Found LLVM ${LLVM_VERSION_MAJOR}, but need LLVM 17 or above")
 endif()
 
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
@@ -71,7 +74,7 @@ link_directories(${LLVM_LIBRARY_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
 
 #===============================================================================
-# 3. Region Packing Pass Build
+# 3. LLVM-TUTOR BUILD CONFIGURATION
 #===============================================================================
 # Use the same C++ standard as LLVM does
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "")
@@ -105,8 +108,11 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/lib")
 
 #===============================================================================
-# 4. Add Sub-Targets
+# 4. ADD SUB-TARGETS
 # Doing this at the end so that all definitions and link/include paths are
 # available for the sub-projects.
 #===============================================================================
 add_subdirectory(lib)
+# add_subdirectory(tools)
+# add_subdirectory(test)
+# add_subdirectory(HelloWorld)

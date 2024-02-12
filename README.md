@@ -1,9 +1,17 @@
-# Region Packing Pass
+# RebaseDL Pass
 
-Identifies opportunities for region-based structure splitting, field reordering, and data packing.
-It is run as a link-time optimization, but it can also be run as a regular function pass.
+LLVM out-of-tree pass that identifies opportunities for region-based structure splitting, field reordering, and data packing.
 Based on [LLVM Tutor](https://github.com/banach-space/llvm-tutor).
+
+Currently, it uses **LLVM 17.0.0**.
 ## Build Instructions
+
+Set these variables to the correct paths and export them:
+
+```sh
+export LLVM_INSTALL="/path/to/llvm/install"
+export REGION_PACKING_ROOT="/path/to/region-packing-pass"
+```
 
 ### Build Binutils
 
@@ -19,7 +27,7 @@ make all-gold
 ### Build and Install LLVM
 
 ```sh
-git clone -b llvmorg-16.0.0 https://github.com/llvm/llvm-project.git
+git clone --depth 1 -b llvmorg-17.0.0 https://github.com/llvm/llvm-project.git
 cd llvm-project
 mkdir build
 cd build
@@ -37,19 +45,10 @@ cmake -DLLVM_ENABLE_PROJECTS="clang;lld"                         \
       -DCMAKE_BUILD_TYPE=Release                                 \
       -G Ninja ../llvm
 ninja
-cmake --install . --prefix /path/to/llvm/install
+cmake --install . --prefix ${LLVM_INSTALL}
 ```
 
 ### Build Region Packing Pass
-
-1. Set these variables to the correct paths and export them:
-
-```sh
-export LLVM_INSTALL="/path/to/llvm/install"
-export REGION_PACKING_ROOT="/path/to/region-packing-pass"
-```
-
-2. Build the out-of-tree pass:
 
 ```sh
 cd ${REGION_PACKING_ROOT}
@@ -65,24 +64,37 @@ make
 
 ## How To Use It
 
-Option 1 is how the pass was tested and used.
-For the other options, adjustments may be needed.
-
-1. Use the pass as a link time pass:
+1. Use the pass as a compile-time pass in the clang pipeline:
 
 ```sh
 ${LLVM_INSTALL}/bin/clang \
         -disable-output \
-        -g -O3 \
-        -flto \
-        -fuse-ld=%{LLVM_INSTALL}/bin/ld.lld \
-        -Wl,--load-pass-plugin=${REGION_PACKING_ROOT}/build/lib/libMannarswamyImprovePass.so \
+        -g -O3 -fno-unroll-loops \
+        -fpass-plugin=${REGION_PACKING_ROOT}/build/lib/libRebaseDLPass.so \
         input.c
 ```
 
-2. The pass can also be used as a pass plugin run from `opt`:
+2. Use the pass as a link-time pass in the clang pipeline:
 
 ```sh
+${LLVM_INSTALL}/bin/clang \
+        -disable-output \
+        -g -O3 -fno-unroll-loops \
+        -flto \
+        -fuse-ld=%{LLVM_INSTALL}/bin/ld.lld \
+        -Wl,--load-pass-plugin=${REGION_PACKING_ROOT}/build/lib/libRebaseDLPass.so \
+        input.c
+```
+
+3. The pass can also be used as a pass plugin run from `opt`:
+
+```sh
+${LLVM_INSTALL}/bin/clang \
+        -g -O3 -fno-unroll-loops \
+        -emit-llvm -S \
+        -o input.ll \
+        input.c
+
 ${LLVM_INSTALL}/bin/opt \
         -disable-output \
         -load-pass-plugin ${REGION_PACKING_ROOT}/build/lib/libRebaseDLPass.so \
@@ -90,14 +102,4 @@ ${LLVM_INSTALL}/bin/opt \
         input.ll
 ```
 
-3. In the function `getRebaseDLPassPluginInfo()`, register the pass using `registerVectorizerStartEPCallback()` to use it as a function pass.
-   Then, it can be used with the following command:
-
-```sh
-${LLVM_INSTALL}/bin/clang \
-        -disable-output \
-        -g -O3 \
-        -fpass-plugin=${REGION_PACKING_ROOT}/build/lib/libMannarswamyImprovePass.so \
-        input.c
-```
-
+To use option 1 or 2, the pass registration in `getRebaseDLPassPluginInfo()` must be updated to insert the pass either at the compile-time pipeline, or at the link-time pipeline.
