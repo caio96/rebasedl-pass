@@ -1,24 +1,15 @@
 #include "RebaseDL.h"
-#include <algorithm>
+#include <llvm/ADT/SmallSet.h>
 #include <llvm/ADT/SetOperations.h>
-#include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/Analysis/BlockFrequencyInfo.h>
-#include <llvm/Analysis/GlobalsModRef.h>
-#include <llvm/Analysis/LoopInfo.h>
-#include <llvm/Analysis/ScalarEvolution.h>
-#include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <llvm/Analysis/ValueTracking.h>
-#include <llvm/Transforms/Scalar/IndVarSimplify.h>
-#include <llvm/Transforms/Scalar/LoopRotation.h>
-#include <llvm/Transforms/Scalar/LICM.h>
-#include <llvm/IR/Argument.h>
-#include <llvm/IR/DataLayout.h>
-#include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/GetElementPtrTypeIterator.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
+#include <llvm/Transforms/Scalar/LICM.h>
+#include <llvm/Transforms/Scalar/LoopRotation.h>
 
 using namespace llvm;
 
@@ -47,7 +38,7 @@ template <typename T> SmallVector<T *> getInstructions(Loop *L) {
   return instructions;
 }
 
-SmallSet<Value *,4> getPtrsUsedInLoop(Loop *loop) {
+SmallSet<Value *, 4> getPtrsUsedInLoop(Loop *loop) {
   SmallSet<Value *, 4> ptrs;
   for (BasicBlock *BB : loop->getBlocks()) {
     for (Instruction &I : *BB) {
@@ -79,10 +70,10 @@ SmallSet<Value *,4> getPtrsUsedInLoop(Loop *loop) {
 // If this is called on a non-pointer value, it returns nullptr and the
 // \p Offset is not modified.
 //
-const Value* stripAccumulateAndCollectGEPs(const Value* V,
-                                           const DataLayout &DL,
-                                           SmallVectorImpl<const GEPOperator*> &geps,
-                                           APInt &Offset) {
+const Value *
+stripAccumulateAndCollectGEPs(const Value *V, const DataLayout &DL,
+                              SmallVectorImpl<const GEPOperator *> &geps,
+                              APInt &Offset) {
   if (!V->getType()->isPointerTy())
     return nullptr;
 
@@ -137,8 +128,8 @@ const Value* stripAccumulateAndCollectGEPs(const Value* V,
       if (!GA->isInterposable())
         V = GA->getAliasee();
     } else if (const auto *Call = dyn_cast<CallBase>(V)) {
-        if (const Value *RV = Call->getReturnedArgOperand())
-          V = RV;
+      if (const Value *RV = Call->getReturnedArgOperand())
+        V = RV;
     } else if (auto *PHI = dyn_cast<PHINode>(V)) {
       // Look through single-arg phi nodes created by LCSSA.
       if (PHI->getNumIncomingValues() == 1) {
@@ -153,13 +144,13 @@ const Value* stripAccumulateAndCollectGEPs(const Value* V,
 
 // Helper function for stripAccumulateAndCollectGEPs
 // Uses an uint64_t instead of APInt and has option parameters
-Value* stripAccumulateAndCollectGEPs(Value* V,
-                                     const DataLayout &DL,
-                                     SmallVectorImpl<const GEPOperator*> *geps = nullptr,
-                                     uint64_t *offset = nullptr) {
+Value *stripAccumulateAndCollectGEPs(
+    Value *V, const DataLayout &DL,
+    SmallVectorImpl<const GEPOperator *> *geps = nullptr,
+    uint64_t *offset = nullptr) {
   const Value *VConst = V;
 
-  SmallVector<const GEPOperator*> geps_unused;
+  SmallVector<const GEPOperator *> geps_unused;
   if (!geps) {
     geps = &geps_unused;
   }
@@ -168,7 +159,8 @@ Value* stripAccumulateAndCollectGEPs(Value* V,
   unsigned IntPtrWidth = DL.getIndexSizeInBits(AS);
   APInt Offset = APInt::getZero(IntPtrWidth);
 
-  Value *basePtr = const_cast<Value *>(stripAccumulateAndCollectGEPs(VConst, DL, *geps, Offset));
+  Value *basePtr = const_cast<Value *>(
+      stripAccumulateAndCollectGEPs(VConst, DL, *geps, Offset));
   if (offset) {
     *offset = Offset.getZExtValue();
   }
@@ -255,7 +247,8 @@ bool isSCEVInvariantToLoop(Loop *loop, const SCEV *scev, ScalarEvolution &SE,
 
 // Checks if a scev is invariant to a loop, but inspects unknowns that are
 // defined by loads by check if their pointer operands are invariant or not
-bool isSCEVReallyInvariantToLoop(Loop *loop, const SCEV *scev, ScalarEvolution &SE) {
+bool isSCEVReallyInvariantToLoop(Loop *loop, const SCEV *scev,
+                                 ScalarEvolution &SE) {
 
   SmallSet<const SCEVUnknown *, 2> unknowns;
   bool isInvariant = isSCEVInvariantToLoop(loop, scev, SE, unknowns);
@@ -295,7 +288,7 @@ bool isSCEVReallyInvariantToLoop(Loop *loop, const SCEV *scev, ScalarEvolution &
       for (auto unk : loadUnknowns) {
         Worklist.push_back(unk->getValue());
       }
-    // If an unknown is not defined by a load just give up
+      // If an unknown is not defined by a load just give up
     } else {
       return false;
     }
@@ -305,7 +298,6 @@ bool isSCEVReallyInvariantToLoop(Loop *loop, const SCEV *scev, ScalarEvolution &
   // Loop invariant
   return true;
 }
-
 
 // Check if pointer is invariant a loop
 bool isPtrInvariantToLoop(Loop *loop, Value *ptrVal, ScalarEvolution &SE) {
@@ -332,14 +324,15 @@ unsigned estimateLoopTripCount(Loop *loop, ScalarEvolution &SE,
 // loop accesses a vector or array of constant size Otherwise it returns default
 // value
 unsigned estimateLoopTripCount(Value *ptrVal, Loop *loop, ScalarEvolution &SE,
-                               const DataLayout &DL, unsigned defaultTrip = 10) {
+                               const DataLayout &DL,
+                               unsigned defaultTrip = 10) {
 
   // If there is a exact trip count, return it
   if (unsigned exactCount = estimateLoopTripCount(loop, SE, /*defaulTrip*/ 0))
     return exactCount;
 
   // get geps that are applied to the ptr
-  SmallVector<const GEPOperator*> geps;
+  SmallVector<const GEPOperator *> geps;
   stripAccumulateAndCollectGEPs(ptrVal, DL, &geps);
 
   // If pointer is not computed by gep, give up
@@ -349,13 +342,13 @@ unsigned estimateLoopTripCount(Value *ptrVal, Loop *loop, ScalarEvolution &SE,
 
   unsigned tripCount = 0;
 
-  // TODO: check if the next line works
   // Initialize type as type of the base ptr
   Type *previousTy = geps.back()->getSourceElementType();
 
   // Look at the gep operands
-  for (SmallVector<const GEPOperator*>::reverse_iterator it=geps.rbegin(); it != geps.rend(); ++it) {
-    const GEPOperator* gep = *it;
+  for (SmallVector<const GEPOperator *>::reverse_iterator it = geps.rbegin();
+       it != geps.rend(); ++it) {
+    const GEPOperator *gep = *it;
 
     for (gep_type_iterator GTI = gep_type_begin(gep), GTE = gep_type_end(gep);
          GTI != GTE; ++GTI) {
@@ -383,9 +376,10 @@ unsigned estimateLoopTripCount(Value *ptrVal, Loop *loop, ScalarEvolution &SE,
         if (stride < 0)
           stride *= -1;
 
-        // Use the previous and not the current type because if the IV accesses a
-        // vector its indexed type will be the type of the elements of the vector.
-        // The previous indexed type will be a vector of that element type.
+        // Use the previous and not the current type because if the IV accesses
+        // a vector its indexed type will be the type of the elements of the
+        // vector. The previous indexed type will be a vector of that element
+        // type.
         if (auto arrTy = dyn_cast<ArrayType>(previousTy)) {
           unsigned arrTrip = (unsigned)ceilDiv(arrTy->getNumElements(), stride);
           tripCount = std::max(tripCount, arrTrip);
@@ -408,9 +402,9 @@ unsigned estimateLoopTripCount(Value *ptrVal, Loop *loop, ScalarEvolution &SE,
 
 /// Estimates the offset difference of the same GEP between two iterations of
 /// loop. Return nullopt if unknown
-std::optional<uint64_t> getLoopOffset(SmallVectorImpl<const GEPOperator*> &geps,
-                                      Value *basePtr, Loop *loop, ScalarEvolution &SE,
-                                      const DataLayout &DL) {
+std::optional<uint64_t>
+getLoopOffset(SmallVectorImpl<const GEPOperator *> &geps, Value *basePtr,
+              Loop *loop, ScalarEvolution &SE, const DataLayout &DL) {
   if (geps.empty()) {
     return 0;
   }
@@ -425,7 +419,6 @@ std::optional<uint64_t> getLoopOffset(SmallVectorImpl<const GEPOperator*> &geps,
       Value *operand = GTI.getOperand();
       const SCEV *scev = SE.getSCEV(operand);
 
-      // if a sequential index offset if the size of the indexed type
       if (!isSCEVReallyInvariantToLoop(loop, scev, SE)) {
         if (GTI.isSequential()) {
 
@@ -449,7 +442,8 @@ std::optional<uint64_t> getLoopOffset(SmallVectorImpl<const GEPOperator*> &geps,
             stride *= -1;
 
           loopOffset +=
-              DL.getTypeAllocSize(GTI.getIndexedType()).getFixedValue() * stride;
+              DL.getTypeAllocSize(GTI.getIndexedType()).getFixedValue() *
+              stride;
           // give up it is a loop variant structure index
         } else {
           return std::nullopt;
@@ -461,15 +455,14 @@ std::optional<uint64_t> getLoopOffset(SmallVectorImpl<const GEPOperator*> &geps,
   return loopOffset;
 }
 
-// Compute the PIDV value for a list of loads and stores in the context of \p targetLoop
+// Compute the PIDV value for a list of loads and stores in the context of \p
+// targetLoop
 std::optional<uint64_t> getBytesAccessed(SmallVector<Instruction *> &loadStores,
                                          Loop *targetLoop, const DataLayout &DL,
                                          ScalarEvolution &SE, LoopInfo &LI) {
-  // dbgs() << "[RebaseDLPass] PIDV ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
-
   // Save ptrs counted to avoid double count
   // loads and stores that use the same ptr
-  SmallSet<Value *,4> ptrsCounted;
+  SmallSet<Value *, 4> ptrsCounted;
 
   if (loadStores.empty()) {
     return 0;
@@ -488,8 +481,6 @@ std::optional<uint64_t> getBytesAccessed(SmallVector<Instruction *> &loadStores,
       continue;
     }
 
-    // dbgs() << "[RebaseDLPass] instruction: " << *inst << "\n";
-
     // Make sure load is contained in target loop
     if (!targetLoop->contains(inst)) {
       return std::nullopt;
@@ -501,7 +492,6 @@ std::optional<uint64_t> getBytesAccessed(SmallVector<Instruction *> &loadStores,
       return std::nullopt;
     }
     TypeSize fieldSize = DL.getTypeAllocSize(ty);
-    // dbgs() << "[RebaseDLPass] - type size: " << fieldSize << "\n";
 
     // Get loop of the load
     Loop *currLoop = LI.getLoopFor(inst->getParent());
@@ -515,11 +505,6 @@ std::optional<uint64_t> getBytesAccessed(SmallVector<Instruction *> &loadStores,
       if (!isPtrInvariantToLoop(currLoop, ptrVal, SE)) {
         timesAccessed = estimateLoopTripCount(ptrVal, currLoop, SE, DL);
         bytesAccessedByLoad *= timesAccessed;
-        // dbgs() << "[RebaseDLPass] - variant to loop: " <<
-        // currLoop->getName()
-        //        << " at depth " << currLoop->getLoopDepth() << "\n";
-        // dbgs() << "[RebaseDLPass] - trip count: " << timesAccessed <<
-        // "\n";
       }
       currLoop = currLoop->getParentLoop();
     }
@@ -534,18 +519,16 @@ getCacheLinesAccessedInBytes(SmallVector<Instruction *> &loadStores,
                              Loop *targetLoop, const DataLayout &DL,
                              ScalarEvolution &SE, LoopInfo &LI,
                              const int cacheLineSize = 64) {
-  // dbgs() << "[RebaseDLPass] AADV ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
-
   // Save ptrs counted to avoid double count
   // loads and stores that use the same ptr
-  SmallSet<Value *,4> ptrsCounted;
+  SmallSet<Value *, 4> ptrsCounted;
 
   if (loadStores.empty()) {
     return 0;
   }
 
-  // The bit vector represents cache lines accessed
-  // each bit is a cache line, if set, it was accessed
+  // Represents cache lines accessed
+  // each element is a cache line, if set, it was accessed
   SmallSet<int, 4> cacheLinesAccessed{};
 
   // Smallest base offset. Used to avoid simulating that the first field of a
@@ -582,14 +565,12 @@ getCacheLinesAccessedInBytes(SmallVector<Instruction *> &loadStores,
       continue;
     }
 
-    // dbgs() << "[RebaseDLPass] load/store: " << *inst << "\n";
-
-    // compute constantj offset of ptr
+    // compute constant offset of ptr
     // and save geps that are applied to the ptr
     uint64_t constOffset;
-    SmallVector<const GEPOperator*> geps;
-    Value *basePtr = stripAccumulateAndCollectGEPs(ptrVal, DL, &geps, &constOffset);
-    // dbgs() << "[RebaseDLPass] - const offset: " << constOffset << "\n";
+    SmallVector<const GEPOperator *> geps;
+    Value *basePtr =
+        stripAccumulateAndCollectGEPs(ptrVal, DL, &geps, &constOffset);
 
     // Size of field accessed by the load
     Type *ty = getLoadStoreType(inst);
@@ -609,23 +590,21 @@ getCacheLinesAccessedInBytes(SmallVector<Instruction *> &loadStores,
       }
 
       // compute loop offset of the gep
-      std::optional<uint64_t> loopOffset = getLoopOffset(geps, basePtr, currLoop, SE, DL);
+      std::optional<uint64_t> loopOffset =
+          getLoopOffset(geps, basePtr, currLoop, SE, DL);
       if (!loopOffset.has_value()) {
         // dbgs() << "[RebaseDLPass] No loop offset\n";
         return std::nullopt;
       }
-      // dbgs() << "[RebaseDLPass]     - loop offset: " << loopOffset.value()
-      //        << " on loop " << currLoop->getName() << " at depth "
-      //        << currLoop->getLoopDepth() << "\n";
 
       unsigned tripCount = estimateLoopTripCount(ptrVal, currLoop, SE, DL);
-      // dbgs() << "[RebaseDLPass]     - trip count: " << tripCount << "\n";
 
       if (loopOffset.value() == 0) {
         if (loopsOffsetZero.count(currLoop) == 0) {
           loopsOffsetZero[currLoop] = tripCount;
         } else {
-          loopsOffsetZero[currLoop] = std::max(tripCount, loopsOffsetZero[currLoop]);
+          loopsOffsetZero[currLoop] =
+              std::max(tripCount, loopsOffsetZero[currLoop]);
         }
       }
 
@@ -643,8 +622,6 @@ getCacheLinesAccessedInBytes(SmallVector<Instruction *> &loadStores,
       }
       totalTripCount *= tripCount;
     }
-    // dbgs() << "[RebaseDLPass]     - total trip count: " << totalTripCount
-    // << "\n";
 
     // Consider the accesses to all iterations in all loops
     for (unsigned i = 0; i < totalTripCount; i++) {
@@ -662,7 +639,8 @@ getCacheLinesAccessedInBytes(SmallVector<Instruction *> &loadStores,
       // check at which cache line the bytes in the start, the end, and
       // in the middle of the of the field access fall into
       for (uint64_t j = 0; j < fieldSize; j++) {
-        unsigned cacheLine = (loopPart + (constOffset - adjustConstOffset) + j) / cacheLineSize;
+        unsigned cacheLine =
+            (loopPart + (constOffset - adjustConstOffset) + j) / cacheLineSize;
         cacheLinesAccessed.insert(cacheLine);
       }
     }
@@ -673,9 +651,6 @@ getCacheLinesAccessedInBytes(SmallVector<Instruction *> &loadStores,
     unsigned tripCount = loopTrip.second;
     totalCacheLinesAccessed *= tripCount;
   }
-
-  // dbgs() << "[RebaseDLPass] Total cache lines in bytes: " << totalCacheLinesAccessed
-  // << "\n";
 
   return totalCacheLinesAccessed;
 }
@@ -691,14 +666,12 @@ public:
   // The elements of the pair are:
   // uint64_t: constant offset of applied to the ptr
   // Value*: basePtr of the load
-  SmallSet<std::pair<uint64_t, Value*>, 2> ptrLoads;
+  SmallSet<std::pair<uint64_t, Value *>, 2> ptrLoads;
 
   RegionPackingMemReg(){};
 
   RegionPackingMemReg(Value *ptrVal, const DataLayout &DL) {
-    if (ptrVal->getType()->isPointerTy()) {
-      this->addPtr(ptrVal, DL);
-    }
+    this->addPtr(ptrVal, DL);
   };
 
   // Add ptr to this memory region
@@ -743,9 +716,10 @@ public:
 
       // Add info about the loads that define these underlying objects
       if (auto load = dyn_cast<LoadInst>(obj)) {
-        Value* ptrOperand = const_cast<Value *>(load->getPointerOperand());
-        std::pair<uint64_t, Value*> ptrLoad;
-        ptrLoad.second = stripAccumulateAndCollectGEPs(ptrOperand, DL, nullptr, &ptrLoad.first);
+        Value *ptrOperand = const_cast<Value *>(load->getPointerOperand());
+        std::pair<uint64_t, Value *> ptrLoad;
+        ptrLoad.second = stripAccumulateAndCollectGEPs(ptrOperand, DL, nullptr,
+                                                       &ptrLoad.first);
         this->ptrLoads.insert(ptrLoad);
       }
     }
@@ -769,8 +743,8 @@ public:
 
     // TODO: maybe consider multiple levels of pointer loads, not just one
     // If two memregs have an underlying object that is defined by a load
-    // that loads from the same base pointer with the same offset, the underlying
-    // objects are the same. This check is needed because sometimes
+    // that loads from the same base pointer with the same offset, the
+    // underlying objects are the same. This check is needed because sometimes
     // the same ptr is loaded multiple times
     for (auto thisPtrLoad : this->ptrLoads) {
       for (auto otherPtrLoad : other.ptrLoads) {
@@ -825,7 +799,8 @@ public:
 
   // Returns true if this memReg has a load that
   // is variant to a child loop of \p parentLoop
-  bool isVariantToChildLoop(Loop *parentLoop, LoopInfo &LI, ScalarEvolution &SE) {
+  bool isVariantToChildLoop(Loop *parentLoop, LoopInfo &LI,
+                            ScalarEvolution &SE) {
     auto loopNest = parentLoop->getLoopsInPreorder();
 
     for (auto ptrVal : this->ptrs) {
@@ -874,7 +849,7 @@ public:
           if (loop->contains(loadInst)) {
             loadStores.push_back(loadInst);
           }
-        // Store uses ptrVal as the pointer operand
+          // Store uses ptrVal as the pointer operand
         } else if (auto storeInst = dyn_cast<StoreInst>(user)) {
           if (loop->contains(storeInst) &&
               ptrVal == storeInst->getPointerOperand()) {
@@ -911,7 +886,7 @@ public:
           if (!targetLoop || targetLoop->contains(loadInst)) {
             loads.push_back(loadInst);
           }
-        // Store uses ptrVal as the pointer operand
+          // Store uses ptrVal as the pointer operand
         } else if (auto storeInst = dyn_cast<StoreInst>(user)) {
           if (ptrVal == storeInst->getPointerOperand() &&
               (!targetLoop || targetLoop->contains(storeInst))) {
@@ -934,7 +909,8 @@ public:
       for (auto store : stores) {
         dbgs() << "[RebaseDLPass]     - " << *store << "\n";
         if (store->getDebugLoc()) {
-          dbgs() << "[RebaseDLPass]         - " << *store->getDebugLoc() << "\n";
+          dbgs() << "[RebaseDLPass]         - " << *store->getDebugLoc()
+                 << "\n";
         }
       }
     }
@@ -949,7 +925,8 @@ public:
       dbgs() << "[RebaseDLPass]     - " << *mainUnderlyingObj << "\n";
     }
     if (!geps.empty()) {
-      dbgs() << "[RebaseDLPass]     - Type: " << *geps.back()->getSourceElementType() << "\n";
+      dbgs() << "[RebaseDLPass]     - Type: "
+             << *geps.back()->getSourceElementType() << "\n";
     }
 
     dbgs() << "[RebaseDLPass] - Underlying objects:\n";
@@ -983,7 +960,8 @@ getCacheLinesAccessedInBytes(SmallVector<RegionPackingMemReg> &memRegs,
 
   for (RegionPackingMemReg &memReg : memRegs) {
     auto loadStores = memReg.getMemRegLoadStoresInLoop(targetLoop);
-    auto totalCacheLinesAccessed = getCacheLinesAccessedInBytes(loadStores, targetLoop, DL, SE, LI);
+    auto totalCacheLinesAccessed =
+        getCacheLinesAccessedInBytes(loadStores, targetLoop, DL, SE, LI);
     if (totalCacheLinesAccessed.has_value()) {
       total += totalCacheLinesAccessed.value();
     } else {
@@ -999,7 +977,6 @@ public:
   RegionPackingMemReg memReg;
   Loop *targetLoop;
   std::optional<float> cacheUtilization;
-  std::optional<float> memRegImpact;
   std::optional<float> costBenefitRatio;
 
   // Create a new memReg that only holds pointers that are used inside the
@@ -1020,7 +997,8 @@ public:
   /// Packing candidates are sorted for a greedy selection the best candidates
   bool operator<(const RegionPackingCandidate &other) const {
     // Order is based on cost benefit
-    if (this->costBenefitRatio.has_value() && other.costBenefitRatio.has_value()) {
+    if (this->costBenefitRatio.has_value() &&
+        other.costBenefitRatio.has_value()) {
       if (this->costBenefitRatio.value() != other.costBenefitRatio.value()) {
         return this->costBenefitRatio.value() > other.costBenefitRatio.value();
       }
@@ -1036,10 +1014,12 @@ public:
   }
 
   // Checks if it is legal to apply the transformation to a candidate
-  bool isLegal(const DataLayout &DL, ScalarEvolution &SE, AliasAnalysis &AA, LoopInfo &LI) {
+  bool isLegal(const DataLayout &DL, ScalarEvolution &SE, AliasAnalysis &AA,
+               LoopInfo &LI) {
 
     // Get loads and stores of this candidate
-    SmallVector<Instruction *> loadStores = this->memReg.getMemRegLoadStoresInLoop(this->targetLoop);
+    SmallVector<Instruction *> loadStores =
+        this->memReg.getMemRegLoadStoresInLoop(this->targetLoop);
 
     Value *firstBaseObj = nullptr;
     for (auto loadStore : loadStores) {
@@ -1049,7 +1029,8 @@ public:
         return false;
       }
 
-      // Get underlying object of ptrVal without going through phi and select instructions
+      // Get underlying object of ptrVal without going through phi and select
+      // instructions
       Value *baseObj = stripAccumulateAndCollectGEPs(ptrVal, DL);
       // Base object not found
       if (!baseObj) {
@@ -1071,18 +1052,20 @@ public:
     const SCEV *baseObjSCEV = SE.getSCEV(firstBaseObj);
     for (auto loop : this->targetLoop->getLoopsInPreorder()) {
       if (!isSCEVReallyInvariantToLoop(loop, baseObjSCEV, SE)) {
-        dbgs() << "[RebaseDLPass] Legality: Base address defined inside target loop\n";
+        dbgs() << "[RebaseDLPass] Legality: Base address defined inside target "
+                  "loop\n";
         return false;
       }
     }
 
     // TODO: If the base ptr is a load instruction defined in the target Loop,
-    // we already know that it is invariant to the loop, but we may need to check if
-    // if the pointer operand of this load is not passed to any functions in the loop
-    // as they could access the memreg by making the load again.
+    // we already know that it is invariant to the loop, but we may need to
+    // check if if the pointer operand of this load is not passed to any
+    // functions in the loop as they could access the memreg by making the load
+    // again.
 
     // Get the loops that loads and store of the candidate are variant with
-    SmallSet<Loop*,2> loopsToBeCopied;
+    SmallSet<Loop *, 2> loopsToBeCopied;
     for (auto inst : loadStores) {
       Loop *currLoop = LI.getLoopFor(inst->getParent());
       while (currLoop != targetLoop) {
@@ -1093,8 +1076,8 @@ public:
       }
     }
 
-    // Must be able to determine bounds of loops to be copied for the transformation
-    // Otherwise illegal
+    // Must be able to determine bounds of loops to be copied for the
+    // transformation Otherwise illegal
     for (auto loop : loopsToBeCopied) {
       auto bounds = loop->getBounds(SE);
       if (bounds == std::nullopt) {
@@ -1111,21 +1094,15 @@ public:
       const SCEV *scevFinalIV = SE.getSCEV(finalIVVal);
       const SCEV *scevStep = SE.getSCEV(stepVal);
 
-      // dbgs() << "[RebaseDLPass] Depth: " << loop->getLoopDepth() << "\n";
-      // dbgs() << "[RebaseDLPass] Initial IV " << *scevInitialIV << "\n";
-      // dbgs() << "[RebaseDLPass] Final IV Value " << *scevFinalIV << "\n";
-      // dbgs() << "[RebaseDLPass] Step Value " << *scevStep << "\n";
-      // dbgs() << "[RebaseDLPass] Initial IV " << *initialIVVal << "\n";
-      // dbgs() << "[RebaseDLPass] Final IV Value " << *finalIVVal << "\n";
-      // dbgs() << "[RebaseDLPass] Step Value " << *stepVal << "\n";
-
-      // Bounds must be invariant to the target loop (and to the inner loops too)
+      // Bounds must be invariant to the target loop (and to the inner loops
+      // too)
       Loop *currLoop = loop;
       while (currLoop != targetLoop->getParentLoop()) {
         if (!isSCEVReallyInvariantToLoop(currLoop, scevInitialIV, SE) ||
             !isSCEVReallyInvariantToLoop(currLoop, scevFinalIV, SE) ||
             !isSCEVReallyInvariantToLoop(currLoop, scevStep, SE)) {
-          dbgs() << "[RebaseDLPass] Legality: Bounds variant to target loop nest\n";
+          dbgs() << "[RebaseDLPass] Legality: Bounds variant to target loop "
+                    "nest\n";
           return false;
         }
         currLoop = currLoop->getParentLoop();
@@ -1176,8 +1153,10 @@ public:
       // This check is here because the getModRefInfo function will check if the
       // underlying object of the memory location instruction is a global, so it
       // does not work if the memReg has multiple underlying objects
-      if (this->memReg.underlyingObjects.size() > 1 || globals[0] != firstBaseObj) {
-        dbgs() << "[RebaseDLPass] Legality: Accesses a global underlying object that is not the only underlying and base object\n";
+      if (this->memReg.underlyingObjects.size() > 1 ||
+          globals[0] != firstBaseObj) {
+        dbgs() << "[RebaseDLPass] Legality: Accesses a global underlying "
+                  "object that is not the only underlying and base object\n";
         return false;
       }
 
@@ -1186,9 +1165,9 @@ public:
         return false;
       }
 
-      // Since the base underlying object of all loads was ensured to be the same
-      // we can pass the any of the load/store instructions as the memory location
-      // if it is a global
+      // Since the base underlying object of all loads was ensured to be the
+      // same we can pass the any of the load/store instructions as the memory
+      // location if it is a global
       for (auto call : calls) {
         auto memLoc = MemoryLocation::get(loadStores[0]);
         if (AA.getModRefInfo(call, memLoc) != ModRefInfo::NoModRef) {
@@ -1216,17 +1195,16 @@ public:
     return false;
   }
 
-  void computeCostBenefit(SmallVector<RegionPackingMemReg> &memRegs,
-                          const DataLayout &DL, ScalarEvolution &SE,
-                          LoopInfo &LI, BlockFrequencyInfo &BFI, DominatorTree &DT) {
-    // dbgs() << "[RebaseDLPass] Cost/Benefit ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
-
+  void computeCostBenefit(const DataLayout &DL, ScalarEvolution &SE,
+                          LoopInfo &LI, BlockFrequencyInfo &BFI,
+                          DominatorTree &DT) {
     // Get loads and stores for this candidate
-    SmallVector<Instruction *> loadStores = this->memReg.getMemRegLoadStoresInLoop(this->targetLoop);
+    SmallVector<Instruction *> loadStores =
+        this->memReg.getMemRegLoadStoresInLoop(this->targetLoop);
 
     // Get the loops that loads and store have as parents inside the target loop
     // (including the target loop)
-    SmallSet<Loop*,2> parentLoops;
+    SmallSet<Loop *, 2> parentLoops;
     for (auto inst : loadStores) {
       Loop *currLoop = LI.getLoopFor(inst->getParent());
       while (currLoop != targetLoop->getParentLoop()) {
@@ -1250,7 +1228,7 @@ public:
         return;
       }
 
-      SmallVector<BasicBlock*> nonLatchExits;
+      SmallVector<BasicBlock *> nonLatchExits;
       loop->getUniqueNonLatchExitBlocks(nonLatchExits);
 
       // If it has multiple exits, check if it is only because of asserts
@@ -1265,14 +1243,15 @@ public:
     }
 
     // Get blocks for load/stores
-    SmallSet<BasicBlock*,2> loadStoreBlocks;
-    for (auto loadStore: loadStores) {
+    SmallSet<BasicBlock *, 2> loadStoreBlocks;
+    for (auto loadStore : loadStores) {
       loadStoreBlocks.insert(loadStore->getParent());
     }
     // Get frequency for the header of the target loop
-    uint64_t targetHeaderFreq = BFI.getBlockFreq(this->targetLoop->getHeader()).getFrequency();
+    uint64_t targetHeaderFreq =
+        BFI.getBlockFreq(this->targetLoop->getHeader()).getFrequency();
     const double minFreqRatio = 0.35;
-    for (auto block: loadStoreBlocks) {
+    for (auto block : loadStoreBlocks) {
       // Get node in the dominator tree for the basic block of load/store
       auto node = DT.getNode(block);
 
@@ -1283,15 +1262,15 @@ public:
 
         // Sanity check
         if (!this->targetLoop->contains(node->getBlock())) {
-          dbgs() << "[RebaseDLPass] ERROR: Load/Store without pointer operand\n";
+          dbgs()
+              << "[RebaseDLPass] ERROR: Load/Store without pointer operand\n";
           return;
         }
 
         uint64_t idomFreq = BFI.getBlockFreq(node->getBlock()).getFrequency();
         if (idomFreq < targetHeaderFreq * minFreqRatio) {
-          // dbgs() << "[RebaseDLPass] BFI: targetHeaderFreq = " << targetHeaderFreq << "\n";
-          // dbgs() << "[RebaseDLPass] - BFI: idomFreq/targetHeaderFreq = " << format("%.3f", idomFreq / (double) targetHeaderFreq) << "\n";
-          dbgs() << "[RebaseDLPass] Cost/Benefit: Load dominator has a frequency that is too low\n";
+          dbgs() << "[RebaseDLPass] Cost/Benefit: Load dominator has a "
+                    "frequency that is too low\n";
           return;
         }
 
@@ -1327,7 +1306,7 @@ public:
     // Compute data usage ratio and check if this candidate is bellow the
     // threshold
     this->cacheUtilization =
-        (float)bytesAccessed.value() / cacheLinesAccessedInBytes.value();
+        static_cast<float>(bytesAccessed.value())  / cacheLinesAccessedInBytes.value();
     const float utilizationThreshold = 0.5;
     if (this->cacheUtilization > utilizationThreshold) {
       dbgs() << "[RebaseDLPass] Cost/Benefit: Above DU threshold\n";
@@ -1358,38 +1337,13 @@ public:
       return;
     }
 
-    auto totalCacheLinesAccessed = getCacheLinesAccessedInBytes(memRegs, this->targetLoop, DL, SE, LI);
-    if (totalCacheLinesAccessed.has_value()) {
-      this->memRegImpact = (float)cacheLinesAccessedInBytes.value()/totalCacheLinesAccessed.value();
-      // If the reduction in cache lines by applying the transformation
-      // represents less than 10% of the cache lines accessed by the loop
-      // give up as the impact on performance will likely be very low
-      // if (benefit < 0.05 * totalCacheLinesAccessed.value()) {
-      //   // dbgs() << "[RebaseDLPass] Benefit compared to total cache lines accessed is too low\n";
-      //   this->costBenefit = 0;
-      //   return;
-      // }
-    }
-
     // Multiply the benefit by the number of iterations of the invariant target
     // loop
-    int64_t overallBenefit = benefit * estimateLoopTripCount(this->targetLoop, SE);
+    int64_t overallBenefit =
+        benefit * estimateLoopTripCount(this->targetLoop, SE);
 
     // Compute net benefit
-    this->costBenefitRatio = (float)cost/overallBenefit;
-
-    // dbgs() << "[RebaseDLPass] - PIDV: " << bytesAccessed.value() << "\n";
-    // dbgs() << "[RebaseDLPass] - AADV: " <<
-    // cacheLinesAccessedInBytes.value()
-    //        << "\n";
-    // dbgs() << "[RebaseDLPass] - DVoh: " << unusedCacheLineBytes << "\n ";
-    // dbgs() << "[RebaseDLPass] - DVoh_rbls : "
-    //        << unusedCacheLineBytesAfterTransformation << "\n";
-    // dbgs() << "[RebaseDLPass] - Reuse iterations: "
-    //        << estimateLoopTripCount(this->targetLoop, SE) << "\n";
-    // dbgs() << "[RebaseDLPass] - Benefit: " << benefit << "\n";
-    // dbgs() << "[RebaseDLPass] - Cost: " << cost << "\n";
-    // dbgs() << "[RebaseDLPass] - net: " << this->costBenefit << "\n";
+    this->costBenefitRatio = static_cast<float>(cost) / overallBenefit;
   }
 
   bool isBeneficial() {
@@ -1411,25 +1365,18 @@ public:
     if (this->cacheUtilization.has_value())
       dbgs() << "[RebaseDLPass] Cache utilization: "
              << format("%.3f", this->cacheUtilization.value()) << "\n";
-    if (this->memRegImpact.has_value())
-      dbgs() << "[RebaseDLPass] Cache impact: "
-             << format("%.3f", this->memRegImpact.value()) << "\n";
     if (this->costBenefitRatio.has_value())
-      dbgs() << "[RebaseDLPass] Cost benefit: " << format("%.8f", this->costBenefitRatio.value())
-             << "\n";
+      dbgs() << "[RebaseDLPass] Cost benefit: "
+             << format("%.8f", this->costBenefitRatio.value()) << "\n";
     this->memReg.dump(DL, this->targetLoop);
     dbgs() << "[RebaseDLPass] ==================================\n";
     dbgs() << "[RebaseDLPass] \n";
   }
 };
 
-void runOnOuterLoop(Loop *outerLoop, DenseSet<Loop *> &copyLoops,
-                    const DataLayout &DL, LoopInfo &LI, ScalarEvolution &SE,
-                    AliasAnalysis &AA, BlockFrequencyInfo &BFI, DominatorTree &DT) {
-
-  // Skip copy loops created by this pass
-  if (copyLoops.count(outerLoop) != 0)
-    return;
+void runOnOuterLoop(Loop *outerLoop, const DataLayout &DL, LoopInfo &LI,
+                    ScalarEvolution &SE, AliasAnalysis &AA,
+                    BlockFrequencyInfo &BFI, DominatorTree &DT) {
 
   // Get pointers used in outer loop
   auto ptrsUsed = getPtrsUsedInLoop(outerLoop);
@@ -1438,21 +1385,12 @@ void runOnOuterLoop(Loop *outerLoop, DenseSet<Loop *> &copyLoops,
     return;
   }
 
-  // Get loads that use the pointer in the loop
-  SmallVector<LoadInst *> ptrsLoads;
-  for (Value *pointer : ptrsUsed) {
-    for (auto pointerLoad : pointer->users()) {
-      if (LoadInst *instruction = dyn_cast<LoadInst>(pointerLoad)) {
-        if (outerLoop->contains(instruction)) {
-          ptrsLoads.push_back(instruction);
-        }
-      }
-    }
-  }
-  // Give up if there are no loads,
-  // a loop with only stores is not a candidate for the transformation
+  // Get loads in the loop
+  SmallVector<LoadInst *> ptrsLoads = getInstructions<LoadInst>(outerLoop);
+  // Give up if there are no loads, a loop with only
+  // stores is not a candidate for the transformation
   if (ptrsLoads.empty()) {
-    // dbgs() << "[RebaseDLPass] No ptr loads in loop\n";
+    // dbgs() << "[RebaseDLPass] No loads in loop nest\n";
     return;
   }
 
@@ -1462,7 +1400,7 @@ void runOnOuterLoop(Loop *outerLoop, DenseSet<Loop *> &copyLoops,
   for (LoadInst *pointerLoad : ptrsLoads) {
     maxLoopDepth =
         std::max(maxLoopDepth, LI.getLoopDepth(pointerLoad->getParent()));
-    if (maxLoopDepth > requiredLoopDepth) {
+    if (maxLoopDepth >= requiredLoopDepth) {
       break;
     }
   }
@@ -1565,7 +1503,7 @@ void runOnOuterLoop(Loop *outerLoop, DenseSet<Loop *> &copyLoops,
 
   // Compute benefit of remaining candidates
   for (RegionPackingCandidate &candidate : candidates) {
-    candidate.computeCostBenefit(memRegs, DL, SE, LI, BFI, DT);
+    candidate.computeCostBenefit(DL, SE, LI, BFI, DT);
   }
   // Remove candidates that are not beneficial
   candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
@@ -1621,8 +1559,7 @@ void runOnOuterLoop(Loop *outerLoop, DenseSet<Loop *> &copyLoops,
   }
 }
 
-PreservedAnalyses RebaseDLPass::run(Function &F,
-                                              FunctionAnalysisManager &FAM) {
+PreservedAnalyses RebaseDLPass::run(Function &F, FunctionAnalysisManager &FAM) {
   // Get data layout of module
   Module *M = F.getParent();
   const DataLayout &DL = M->getDataLayout();
@@ -1634,15 +1571,9 @@ PreservedAnalyses RebaseDLPass::run(Function &F,
   BlockFrequencyInfo &BFI = FAM.getResult<BlockFrequencyAnalysis>(F);
   DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
 
-  // Stores loops created by this pass
-  DenseSet<Loop *> copyLoops;
-
-  // if (F.getName() == "build_domain_forest")
-  //   F.print(dbgs());
-
-  for (auto loop : LI.getTopLevelLoops()) {
-    runOnOuterLoop(loop, copyLoops, DL, LI, SE, AA, BFI, DT);
-  }
+  // Run pass on every outer loop
+  for (auto loop : LI.getTopLevelLoops())
+    runOnOuterLoop(loop, DL, LI, SE, AA, BFI, DT);
 
   return PreservedAnalyses::all();
 }
@@ -1652,34 +1583,47 @@ PreservedAnalyses RebaseDLPass::run(Function &F,
 //-----------------------------------------------------------------------------
 // Register in pipeline:
 
+// Use the O1, O2, or O3 pipelines
+// The extra passes are needed if clang is compiled with O2 or O3
+// For O2 and O3, disable loop unrolling
 PassPluginLibraryInfo getRebaseDLPassPluginInfo() {
   const auto callback = [](PassBuilder &PB) {
-    PB.registerFullLinkTimeOptimizationLastEPCallback([&](ModulePassManager &MPM, auto) {
-      MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LoopRotatePass())));
-      MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LICMPass(LICMOptions()), /*UseMemorySSA*/ true)));
-      MPM.addPass(createModuleToFunctionPassAdaptor(RebaseDLPass()));
-      return true;
-    });
+    // Link-time pipeline
+    PB.registerFullLinkTimeOptimizationLastEPCallback(
+        [&](ModulePassManager &MPM, auto) {
+          MPM.addPass(createModuleToFunctionPassAdaptor(
+              createFunctionToLoopPassAdaptor(LoopRotatePass())));
+          MPM.addPass(
+              createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(
+                  LICMPass(LICMOptions()), /*UseMemorySSA*/ true)));
+          MPM.addPass(createModuleToFunctionPassAdaptor(RebaseDLPass()));
+          return true;
+        });
 
-    // PB.registerVectorizerStartEPCallback([&](FunctionPassManager &FPM, auto) {
+    // Compile-time pipeline
+    // PB.registerVectorizerStartEPCallback([&](FunctionPassManager &FPM, auto)
+    // {
     //   FPM.addPass(createFunctionToLoopPassAdaptor(LoopRotatePass()));
-    //   FPM.addPass(createFunctionToLoopPassAdaptor(LICMPass(LICMOptions()), /*UseMemorySSA*/ true));
-    //   FPM.addPass(RebaseDLPass());
-    //   return true;
+    //   FPM.addPass(createFunctionToLoopPassAdaptor(LICMPass(LICMOptions()),
+    //   /*UseMemorySSA*/ true)); FPM.addPass(RebaseDLPass()); return true;
     // });
 
+    // Call it with opt
     PB.registerPipelineParsingCallback(
-      [](StringRef Name, llvm::FunctionPassManager &PM,
-         ArrayRef<llvm::PassBuilder::PipelineElement>) {
-        if (Name == "rebasedl") {
-          PM.addPass(RebaseDLPass());
-          return true;
-        }
-        return false;
-      });
+        [](StringRef Name, llvm::FunctionPassManager &FPM,
+           ArrayRef<llvm::PassBuilder::PipelineElement>) {
+          if (Name == "rebasedl") {
+            FPM.addPass(createFunctionToLoopPassAdaptor(LoopRotatePass()));
+            FPM.addPass(createFunctionToLoopPassAdaptor(LICMPass(LICMOptions()),
+                                                        /*UseMemorySSA*/ true));
+            FPM.addPass(RebaseDLPass());
+            return true;
+          }
+          return false;
+        });
   };
 
-  return {LLVM_PLUGIN_API_VERSION, "rebasedl-pass", "0.0.1", callback};
+  return {LLVM_PLUGIN_API_VERSION, "RebaseDL", LLVM_VERSION_STRING, callback};
 };
 
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
